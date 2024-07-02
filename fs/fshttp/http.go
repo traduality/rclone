@@ -7,12 +7,14 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httputil"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -277,6 +279,42 @@ func gunzipData(data []byte) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
+type BodyReadCloser struct {
+	body io.ReadCloser
+	err  error
+	data []byte
+}
+
+func (b *BodyReadCloser) Close() error {
+	return b.body.Close()
+}
+
+// ReadPartialBody reads the body and stores it in the data buffer
+func (b *BodyReadCloser) ReadHead(p []byte) {
+	n, err := b.body.Read(p)
+	if err != nil && err != io.EOF {
+		b.err = err
+		return
+	}
+	b.data = append(b.data, p[:n]...)
+}
+
+func (b *BodyReadCloser) Read(p []byte) (n int, err error) {
+	// If we have data in the buffer, return that
+	if len(b.data) > 0 {
+		n = copy(p, b.data)
+		b.data = b.data[n:]
+		b.err = nil
+		return n, nil
+	}
+
+	if b.err != nil && b.err != io.EOF {
+		return 0, b.err
+	}
+
+	return b.body.Read(p)
+}
+
 // RoundTrip implements the RoundTripper interface.
 func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error) {
 	// Limit transactions per second if required
@@ -316,42 +354,23 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 		if err != nil {
 			fs.Debugf(nil, "Error: %v", err)
 		} else {
-			buf, _ := httputil.DumpResponse(resp, t.dump&(fs.DumpBodies|fs.DumpResponses) != 0)
-			if t.dump&fs.DumpAuth == 0 {
-				buf = cleanAuths(buf)
+			fs.Debugf(nil, "%s", "+++++ Header +++++")
+			for k, v := range resp.Header {
+				fs.Debugf(nil, "%s: %s", k, strings.Join(v, ", "))
 			}
-			headerEnd := bytes.Index(buf, []byte("\r\n\r\n"))
-			if headerEnd > 0 {
-				header := buf[:headerEnd]
-
-				if t.dump&(fs.DumpHeaders|fs.DumpResponses) != 0 {
-					fs.Debugf(nil, "%s", "+++++ Header +++++")
-					fs.Debugf(nil, "%s", string(header))
-					fs.Debugf(nil, "%s", "----- Header -----")
+			fs.Debugf(nil, "%s", "----- Header -----")
+			if t.dump&fs.DumpBodies != 0 {
+				body := &BodyReadCloser{
+					body: resp.Body,
 				}
-
-				if t.dump&fs.DumpBodies != 0 {
-					if bytes.Contains(header, []byte("Content-Disposition")) {
-						fs.Debugf(nil, "Attachment detected")
-					}
-
-					fs.Debugf(nil, "%s", "+++++ Body +++++")
-					if len(buf) > headerEnd+4 {
-						body := buf[headerEnd+4:]
-						if bytes.Contains(header, []byte("Content-Encoding: gzip")) {
-							body, _ = gunzipData(body)
-						}
-
-						if len(body) > 1024 {
-							body = body[:1024]
-						}
-						fs.Debugf(nil, "%s", string(cleanResponseBody(body)))
-					}
-					fs.Debugf(nil, "%s", "----- Body -----")
-				}
+				resp.Body = body
+				data := make([]byte, 1024)
+				body.ReadHead(data)
+				fs.Debugf(nil, "+++++ Body +++++")
+				fs.Debugf(nil, "%s", cleanResponseBody(data))
+				fs.Debugf(nil, "----- Body -----")
 			}
 		}
-		fs.Debugf(nil, "%s", separatorResp)
 		logMutex.Unlock()
 	}
 	// Update metrics
