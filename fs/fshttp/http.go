@@ -3,6 +3,7 @@ package fshttp
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -247,6 +248,35 @@ func cleanAuths(buf []byte) []byte {
 	return buf
 }
 
+func cleanResponseBody(buf []byte) []byte {
+	cleaned := make([]byte, len(buf))
+	for i, b := range buf {
+		if b >= 32 || b <= 126 {
+			cleaned[i] = b
+			continue
+		}
+
+		cleaned[i] = '?'
+	}
+
+	return cleaned
+}
+
+func gunzipData(data []byte) ([]byte, error) {
+	r, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+
+	var out bytes.Buffer
+	_, err = out.ReadFrom(r)
+	if err != nil {
+		return nil, err
+	}
+
+	return out.Bytes(), nil
+}
+
 // RoundTrip implements the RoundTripper interface.
 func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error) {
 	// Limit transactions per second if required
@@ -261,6 +291,7 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 	if t.filterRequest != nil {
 		t.filterRequest(req)
 	}
+
 	// Logf request
 	if t.dump&(fs.DumpHeaders|fs.DumpBodies|fs.DumpAuth|fs.DumpRequests|fs.DumpResponses) != 0 {
 		buf, _ := httputil.DumpRequestOut(req, t.dump&(fs.DumpBodies|fs.DumpRequests) != 0)
@@ -276,6 +307,7 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 	}
 	// Do round trip
 	resp, err = t.Transport.RoundTrip(req)
+
 	// Logf response
 	if t.dump&(fs.DumpHeaders|fs.DumpBodies|fs.DumpAuth|fs.DumpRequests|fs.DumpResponses) != 0 {
 		logMutex.Lock()
@@ -285,7 +317,39 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 			fs.Debugf(nil, "Error: %v", err)
 		} else {
 			buf, _ := httputil.DumpResponse(resp, t.dump&(fs.DumpBodies|fs.DumpResponses) != 0)
-			fs.Debugf(nil, "%s", string(buf))
+			if t.dump&fs.DumpAuth == 0 {
+				buf = cleanAuths(buf)
+			}
+			headerEnd := bytes.Index(buf, []byte("\r\n\r\n"))
+			if headerEnd > 0 {
+				header := buf[:headerEnd]
+
+				if t.dump&(fs.DumpHeaders|fs.DumpResponses) != 0 {
+					fs.Debugf(nil, "%s", "+++++ Header +++++")
+					fs.Debugf(nil, "%s", string(header))
+					fs.Debugf(nil, "%s", "----- Header -----")
+				}
+
+				if t.dump&fs.DumpBodies != 0 {
+					if bytes.Contains(header, []byte("Content-Disposition")) {
+						fs.Debugf(nil, "Attachment detected")
+					}
+
+					fs.Debugf(nil, "%s", "+++++ Body +++++")
+					if len(buf) > headerEnd+4 {
+						body := buf[headerEnd+4:]
+						if bytes.Contains(header, []byte("Content-Encoding: gzip")) {
+							body, _ = gunzipData(body)
+						}
+
+						if len(body) > 1024 {
+							body = body[:1024]
+						}
+						fs.Debugf(nil, "%s", string(cleanResponseBody(body)))
+					}
+					fs.Debugf(nil, "%s", "----- Body -----")
+				}
+			}
 		}
 		fs.Debugf(nil, "%s", separatorResp)
 		logMutex.Unlock()
